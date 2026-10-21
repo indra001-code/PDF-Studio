@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, Crop, Fingerprint,
   Circle, FileImage, FilePlus2, FileText, Files, Highlighter, ImagePlus,
-  Layers3, LoaderCircle, LockKeyhole, Menu, Minus, MousePointer2,
+  LoaderCircle, LockKeyhole, Menu, Minus, MousePointer2,
   PencilLine, Plus, RotateCcw, RotateCw, ShieldCheck, Sparkles, Trash2, WandSparkles,
   Type, Undo2, Redo2, X,
 } from 'lucide-react';
@@ -72,7 +72,7 @@ function PathOverlay({ overlay, pageHeight, selected, activeTool, onSelect, onPo
 }
 
 function Brand({ compact = false }) {
-  return <a className="brand" href="#top" onClick={(event) => event.preventDefault()}><span className="brand-mark"><Layers3 size={19} strokeWidth={2.25} /></span><span>pdf<span className="brand-strong">studio</span></span>{compact && <span className="brand-tag">BETA</span>}</a>;
+  return <a className="brand" href="#top" onClick={(event) => event.preventDefault()} aria-label="PDF Studio home"><span className="brand-mark"><img src="/pdf-studio-mark.svg" alt="" /></span><span>pdf<span className="brand-strong">studio</span></span><span className="brand-era"><span>EST.</span><strong>2026</strong></span>{compact && <span className="brand-tag">BETA</span>}</a>;
 }
 
 function PageThumbnail({ file, pageNumber, rotation = 0, selected, onClick }) {
