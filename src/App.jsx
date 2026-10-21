@@ -15,7 +15,7 @@ const TOOL_CARDS = [
 ];
 
 const toolDetails = {
-  select: ['Select', 'Click text to select, drag to move, or double-click to edit.'],
+  select: ['Select', 'Tap an item to select; drag to move, use its corner handle to resize, or double-click text to edit.'],
   text: ['Add text', 'Click on the page to place your text.'],
   highlight: ['Highlight', 'Choose a color and marker style, then drag on the page.'],
   shape: ['Shape', 'Choose a shape and color, then drag on the page.'],
@@ -38,7 +38,16 @@ function pathBounds(points) {
   return { x, y, w: Math.max(0.012, Math.max(...xs) - x), h: Math.max(0.012, Math.max(...ys) - y) };
 }
 
-function PathOverlay({ overlay, pageHeight, selected, activeTool, onSelect }) {
+function overlayWidth(overlay, pageSize) {
+  if (overlay.w) return overlay.w;
+  if (overlay.type === 'image') return 0.24;
+  if (overlay.type !== 'text' && overlay.type !== 'signature') return 0.2;
+  const fontSize = (overlay.fontSize || 18) * pageSize.height / (overlay.referenceHeight || pageSize.height);
+  const longestLine = Math.max(...(overlay.text || '').split('\n').map((line) => line.length), 1);
+  return Math.min(0.92, Math.max(0.12, (longestLine * fontSize * 0.62 + 12) / pageSize.width));
+}
+
+function PathOverlay({ overlay, pageHeight, selected, activeTool, onSelect, onPointerDown, onPointerMove, onPointerUp }) {
   const bounds = pathBounds(overlay.points);
   const strokeWidth = (overlay.strokeWidth || 2) * pageHeight / (overlay.referenceHeight || pageHeight);
   const points = overlay.points.map((point) => `${((point.x - bounds.x) / bounds.w) * 100},${((point.y - bounds.y) / bounds.h) * 100}`).join(' ');
@@ -56,7 +65,7 @@ function PathOverlay({ overlay, pageHeight, selected, activeTool, onSelect }) {
     const right = `${ex - length * Math.cos(angle + Math.PI / 6)},${ey - length * Math.sin(angle + Math.PI / 6)}`;
     arrowHead = `${left} ${ex},${ey} ${right}`;
   }
-  return <svg className={`pdf-overlay path-overlay${selected ? ' overlay-selected' : ''}`} viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={overlay.type === 'highlight' ? 'Freehand highlight' : `Freehand ${overlay.shapeKind}`} onClick={(event) => { if (activeTool === 'select') { event.stopPropagation(); onSelect(); } }} style={{ left: `${bounds.x * 100}%`, top: `${bounds.y * 100}%`, width: `${bounds.w * 100}%`, height: `${bounds.h * 100}%`, color: overlay.color }}>
+  return <svg className={`pdf-overlay path-overlay${selected ? ' overlay-selected' : ''}`} viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={overlay.type === 'highlight' ? 'Freehand highlight' : `Freehand ${overlay.shapeKind}`} onClick={(event) => { if (activeTool === 'select') { event.stopPropagation(); onSelect(); } }} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} style={{ left: `${bounds.x * 100}%`, top: `${bounds.y * 100}%`, width: `${bounds.w * 100}%`, height: `${bounds.h * 100}%`, color: overlay.color }}>
     <polyline points={points} fill="none" stroke="currentColor" strokeWidth={overlay.type === 'highlight' ? Math.max(10, strokeWidth) : strokeWidth} strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={overlay.type === 'highlight' ? '.48' : '1'} />
     {arrowHead && <polyline points={arrowHead} fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />}
   </svg>;
@@ -70,6 +79,7 @@ function PageThumbnail({ file, pageNumber, rotation = 0, selected, onClick }) {
   const canvasRef = useRef(null);
   useEffect(() => {
     let active = true;
+    let observer;
     async function draw() {
       try {
         const { getPdfDocument } = await import('./pdfUtils.js');
@@ -83,8 +93,19 @@ function PageThumbnail({ file, pageNumber, rotation = 0, selected, onClick }) {
         await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
       } catch { /* the main viewer reports document errors */ }
     }
-    draw();
-    return () => { active = false; };
+    const canvas = canvasRef.current;
+    if (canvas && 'IntersectionObserver' in window) {
+      observer = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          draw();
+        }
+      }, { root: canvas.closest('.thumbnail-list'), rootMargin: '160px 0px' });
+      observer.observe(canvas);
+    } else {
+      draw();
+    }
+    return () => { active = false; observer?.disconnect(); };
   }, [file, pageNumber, rotation]);
   return <button className={`thumb-button${selected ? ' thumb-selected' : ''}`} type="button" onClick={onClick} aria-current={selected ? 'page' : undefined}>
     <span className="thumb-paper"><canvas ref={canvasRef} /></span><span className="thumb-num">{pageNumber}</span>
@@ -119,6 +140,10 @@ function App() {
   const [selectedOverlayId, setSelectedOverlayId] = useState(null);
   const [dragOverlay, setDragOverlay] = useState(null);
   const textSizeEditRef = useRef(false);
+  const overlayResizeRef = useRef(null);
+  const zoomRef = useRef(zoom);
+  const pendingZoomRef = useRef(null);
+  const zoomFrameRef = useRef(null);
   const fileInputRef = useRef(null);
   const inputFlowRef = useRef('edit');
   const imageInputRef = useRef(null);
@@ -249,6 +274,34 @@ function App() {
     return () => { cancelled = true; renderTaskRef.current?.cancel(); };
   }, [view, files, page?.fileIndex, page?.sourceIndex, page?.rotation, activePage, zoom]);
 
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    if (!viewer || view !== 'workspace') return undefined;
+    const handleWheel = (event) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      zoomRef.current = Math.max(0.55, Math.min(1.8, zoomRef.current * Math.exp(-event.deltaY * 0.002)));
+      pendingZoomRef.current = zoomRef.current;
+      if (zoomFrameRef.current === null) {
+        zoomFrameRef.current = requestAnimationFrame(() => {
+          zoomFrameRef.current = null;
+          if (pendingZoomRef.current !== null) setZoom(pendingZoomRef.current);
+          pendingZoomRef.current = null;
+        });
+      }
+    };
+    viewer.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      viewer.removeEventListener('wheel', handleWheel);
+      if (zoomFrameRef.current !== null) cancelAnimationFrame(zoomFrameRef.current);
+      zoomFrameRef.current = null;
+    };
+  }, [view]);
+
   useEffect(() => { setSelectedOverlayId(null); textSizeEditRef.current = false; overlayMoveRef.current = null; setDragOverlay(null); }, [activePage]);
 
   const addOverlay = (overlay) => {
@@ -271,17 +324,58 @@ function App() {
   };
 
   const beginOverlayMove = (event, overlay) => {
-    if (activeTool !== 'select' || !['text', 'signature'].includes(overlay.type)) return;
+    if (activeTool !== 'select' || !['text', 'signature', 'image', 'shape', 'highlight'].includes(overlay.type)) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pageCoordinates(event);
-    overlayMoveRef.current = { id: overlay.id, offsetX: point.x - overlay.x, offsetY: point.y - overlay.y, width: overlay.w || 0.2, height: overlay.h || 0.08, startX: overlay.x, startY: overlay.y, nextX: overlay.x, nextY: overlay.y };
+    const width = overlayWidth(overlay, pageSize);
+    const height = overlay.h || 0.08;
+    overlayMoveRef.current = { id: overlay.id, offsetX: point.x - overlay.x, offsetY: point.y - overlay.y, width, height, startX: overlay.x, startY: overlay.y, nextX: overlay.x, nextY: overlay.y };
     setSelectedOverlayId(overlay.id);
-    setDragOverlay({ id: overlay.id, x: overlay.x, y: overlay.y });
+    setDragOverlay({ id: overlay.id, x: overlay.x, y: overlay.y, w: width, h: height });
+  };
+
+  const beginPathMove = (event, overlay) => {
+    if (activeTool !== 'select') return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const bounds = pathBounds(overlay.points);
+    const point = pageCoordinates(event);
+    overlayMoveRef.current = {
+      id: overlay.id,
+      points: overlay.points,
+      offsetX: point.x - bounds.x,
+      offsetY: point.y - bounds.y,
+      startX: bounds.x,
+      startY: bounds.y,
+      width: bounds.w,
+      height: bounds.h,
+      nextX: bounds.x,
+      nextY: bounds.y,
+    };
+    setSelectedOverlayId(overlay.id);
   };
 
   const moveSelectedOverlay = (event) => {
+    const resize = overlayResizeRef.current;
+    if (resize) {
+      const bounds = overlayLayerRef.current?.getBoundingClientRect();
+      if (!bounds) return;
+      if (resize.isText) {
+        const fontSize = Math.round(Math.max(8, Math.min(48, resize.fontSize + ((event.clientY - resize.clientY) * pageSize.referenceHeight / pageSize.height) * 0.5)));
+        resize.nextFontSize = fontSize;
+        setDragOverlay({ id: resize.id, x: resize.x, y: resize.y, fontSize });
+      } else {
+        const w = Math.max(0.04, Math.min(1 - resize.x, resize.w + (event.clientX - resize.clientX) / bounds.width));
+        const h = Math.max(0.04, Math.min(1 - resize.y, resize.h + (event.clientY - resize.clientY) / bounds.height));
+        resize.nextW = w;
+        resize.nextH = h;
+        setDragOverlay({ id: resize.id, x: resize.x, y: resize.y, w, h });
+      }
+      return;
+    }
     const drag = overlayMoveRef.current;
     if (!drag) return;
     const point = pageCoordinates(event);
@@ -289,14 +383,66 @@ function App() {
     const y = Math.max(0, Math.min(1 - drag.height, point.y - drag.offsetY));
     drag.nextX = x;
     drag.nextY = y;
-    setDragOverlay({ id: drag.id, x, y });
+    setDragOverlay(drag.points
+      ? { id: drag.id, dx: x - drag.startX, dy: y - drag.startY }
+      : { id: drag.id, x, y, w: drag.width, h: drag.height });
+  };
+
+  const beginOverlayResize = (event, overlay) => {
+    if (activeTool !== 'select') return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    overlayMoveRef.current = null;
+    const isText = overlay.type === 'text' || overlay.type === 'signature';
+    overlayResizeRef.current = {
+      id: overlay.id,
+      x: overlay.x,
+      y: overlay.y,
+      w: overlayWidth(overlay, pageSize),
+      h: overlay.h || 0.08,
+      fontSize: overlay.fontSize || 18,
+      nextW: overlayWidth(overlay, pageSize),
+      nextH: overlay.h || 0.08,
+      nextFontSize: overlay.fontSize || 18,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      isText,
+    };
+    setSelectedOverlayId(overlay.id);
+  };
+
+  const finishOverlayResize = () => {
+    const resize = overlayResizeRef.current;
+    if (!resize) return;
+    const patch = resize.isText
+      ? { fontSize: resize.nextFontSize }
+      : { w: resize.nextW, h: resize.nextH };
+    const changed = resize.isText
+      ? Math.abs(resize.nextFontSize - resize.fontSize) > 0.01
+      : Math.abs(resize.nextW - resize.w) > 0.001 || Math.abs(resize.nextH - resize.h) > 0.001;
+    if (changed) {
+      updatePages(pages.map((item, index) => index === activePage ? {
+        ...item,
+        overlays: item.overlays.map((overlay) => overlay.id === resize.id ? { ...overlay, ...patch } : overlay),
+      } : item));
+    }
+    overlayResizeRef.current = null;
+    setDragOverlay(null);
   };
 
   const finishOverlayMove = () => {
     const drag = overlayMoveRef.current;
     if (!drag) return;
     if (Math.abs(drag.nextX - drag.startX) > 0.001 || Math.abs(drag.nextY - drag.startY) > 0.001) {
-      updatePages(pages.map((item, index) => index === activePage ? { ...item, overlays: item.overlays.map((overlay) => overlay.id === drag.id ? { ...overlay, x: drag.nextX, y: drag.nextY } : overlay) } : item));
+      updatePages(pages.map((item, index) => index === activePage ? {
+        ...item,
+        overlays: item.overlays.map((overlay) => {
+          if (overlay.id !== drag.id) return overlay;
+          if (drag.points) return { ...overlay, points: drag.points.map((point) => ({ x: point.x + drag.nextX - drag.startX, y: point.y + drag.nextY - drag.startY })) };
+          return { ...overlay, x: drag.nextX, y: drag.nextY };
+        }),
+      } : item));
     }
     overlayMoveRef.current = null;
     setDragOverlay(null);
@@ -411,6 +557,7 @@ function App() {
     setTextDraft(null);
     setSelectedOverlayId(null);
     overlayMoveRef.current = null;
+    overlayResizeRef.current = null;
     setDragOverlay(null);
   };
   const deleteSelectedOverlay = () => {
@@ -507,6 +654,7 @@ function App() {
 
   const returnHome = () => {
     if (busy) return;
+    if (history.length && !window.confirm('Exit the editor? Your original file will stay unchanged, but your edits will be discarded.')) return;
     setView('home'); setFiles([]); setPages([]); setActivePage(0); setError(''); setProgress('');
   };
 
@@ -526,7 +674,7 @@ function App() {
       <header className="site-header"><div className="nav-wrap"><Brand compact /><nav className="main-nav"><a href="#tools">Tools</a><a href="#how-it-works">How it works</a><a href="#privacy">Privacy</a><button className="nav-cta" type="button" onClick={() => startFlow('edit')}>Open a PDF <ArrowRight size={15} /></button></nav><button className="mobile-menu" type="button" onClick={() => startFlow('edit')} aria-label="Open a PDF"><Menu size={20} /></button></div></header>
       <main>
         <section className="hero section-wrap"><div className="hero-copy"><div className="eyebrow"><span className="eyebrow-spark"><Sparkles size={13} /></span> Your documents, right in the browser</div><h1>PDF work,<br /><span>made simple.</span></h1><p className="hero-text">Edit, organize, merge, and convert your PDFs in one friendly workspace. No installs or accounts required.</p><div className="hero-buttons"><button className="button button-primary" type="button" onClick={() => startFlow('edit')}>Open a PDF <ArrowRight size={16} /></button><a className="button button-quiet" href="#tools">Explore the tools <ChevronDown size={15} /></a></div><div className="hero-footnote"><ShieldCheck size={16} /><span>Files stay on your device <i /> Browser-based processing</span></div></div><div className="hero-art"><div className="art-halo" /><div className="preview-shell"><div className="preview-window-bar"><div className="window-dots"><i /><i /><i /></div><span className="preview-file"><FileText size={14} /> project-brief.pdf</span><span className="preview-save"><Check size={13} /> Ready to edit</span></div><div className="preview-app"><aside className="preview-pages"><span className="preview-label">PAGES <small>03</small></span>{[1, 2, 3].map((n) => <div className={`mini-page-wrap${n === 1 ? ' selected' : ''}`} key={n}><div className="mini-page"><b /><span /><span /><span className="short" /><i /><span /><span className="short" /></div><small>{n}</small></div>)}</aside><section className="preview-workspace"><div className="preview-toolbar"><div className="preview-tools"><span className="tool-selected"><MousePointer2 size={15} /></span><span><Type size={15} /></span><span><Highlighter size={15} /></span><span><Circle size={14} /></span></div><div className="preview-actions"><span>−</span><b>100%</b><span>+</span></div></div><div className="paper-stage"><div className="paper-page"><span className="paper-eyebrow">PROJECT OVERVIEW</span><strong>Make room for<br />great work.</strong><span className="paper-line paper-line-wide" /><span className="paper-line" /><span className="paper-line paper-line-mid" /><div className="paper-note"><Sparkles size={13} /> Ideas, organized.</div><span className="paper-line paper-line-wide" /><span className="paper-line paper-line-mid" /><small>01 — INTRODUCTION</small></div><div className="floating-highlight"><Highlighter size={14} /> Highlight</div></div></section></div><div className="preview-caption"><span><span className="caption-dot" /> Edit right in your browser</span><span>PDF Studio</span></div></div><div className="art-spark art-spark-one">✳</div><div className="art-spark art-spark-two">✦</div></div></section>
-        <section className={`home-upload${dragOver ? ' home-upload-active' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={onHomeDrop}><span className="upload-icon"><FileText size={20} /></span><span className="upload-copy"><strong>Drop a PDF here</strong><small>Files stay on your device · Up to 50 MB</small></span><span className="upload-or">or</span><button type="button" onClick={() => startFlow('edit')}>Browse files</button></section>
+        <section className={`home-upload${dragOver ? ' home-upload-active' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={onHomeDrop}><span className="upload-icon"><FileText size={20} /></span><span className="upload-copy"><strong>Drop a PDF here</strong><small>Files stay on your device · Up to 50 MB per file</small></span><span className="upload-or">or</span><button type="button" onClick={() => startFlow('edit')}>Browse files</button></section>
         <section className="trust-strip"><div><span className="trust-icon"><LockKeyhole size={17} /></span>Files processed on your device</div><span className="trust-divider" /><div><span className="trust-icon"><WandSparkles size={17} /></span>Everyday PDF tools</div><span className="trust-divider" /><div><span className="trust-icon"><Fingerprint size={17} /></span>No account needed</div></section>
         <section className="tools-section section-wrap" id="tools"><div className="section-heading"><div><span className="section-kicker">PICK A TOOL</span><h2>What can we help with?</h2></div><p>Choose a task to get started. Your files are opened and processed locally in this browser.</p></div><div className="tool-grid">{TOOL_CARDS.map(({ id, icon: Icon, title, copy }, index) => <button className="tool-card" key={id} type="button" onClick={() => startFlow(id)}><span className={`tool-icon tint-${index}`}><Icon size={21} strokeWidth={1.9} /></span><span className="tool-index">0{index + 1}</span><h3>{title}</h3><p>{copy}</p><span className="tool-card-link">Choose files <ArrowRight size={14} /></span></button>)}</div><div className="privacy-callout" id="privacy"><span className="privacy-callout-icon"><LockKeyhole size={18} /></span><span><strong>Your files stay yours.</strong> Files are processed in your browser and aren’t uploaded to a PDF Studio server.</span><span className="size-note">Up to 50 MB per file</span></div></section>
         <section className="how-section" id="how-it-works"><div className="section-wrap"><div className="how-heading"><span className="section-kicker">QUICK AND STRAIGHTFORWARD</span><h2>Three steps. That’s the whole thing.</h2><p>Keep the task simple and get back to what you were doing.</p></div><div className="how-grid"><article><span className="how-num">01</span><span className="how-icon"><ArrowDownToLine size={19} /></span><h3>Choose your files</h3><p>Pick a PDF or images from your device. No account or upload queue.</p></article><article><span className="how-num">02</span><span className="how-icon"><PencilLine size={19} /></span><h3>Make your changes</h3><p>Annotate pages, arrange them, combine PDFs, or convert to images.</p></article><article><span className="how-num">03</span><span className="how-icon"><Check size={19} /></span><h3>Download and go</h3><p>Save your finished file straight back to your device.</p></article></div></div></section>
@@ -536,10 +684,10 @@ function App() {
       {busy && <div className="toast-progress"><LoaderCircle className="spin" size={17} />{progress || 'Working…'}</div>}
       {error && <div className="toast-error" role="alert"><span>{error}</span><button type="button" aria-label="Dismiss" onClick={() => setError('')}><X size={16} /></button></div>}
     </> : <>
-      <header className="editor-header"><button className="back-brand" type="button" onClick={returnHome}><ArrowLeft size={16} /><Brand compact /></button><div className="editor-filename"><FileText size={15} /><span>{files.length > 1 ? `${files.length} PDFs · ${pages.length} pages` : files[0]?.name}</span><span className="local-pill"><span /> Local</span></div><div className="editor-actions"><button className="icon-button" type="button" title="Undo" onClick={undo} disabled={!history.length}><Undo2 size={17} /></button><button className="icon-button" type="button" title="Redo" onClick={redo} disabled={!redoStack.length}><Redo2 size={17} /></button><button className="button button-primary save-button" type="button" disabled={busy} onClick={isImageExport ? saveImages : savePdf}>{busy ? <LoaderCircle className="spin" size={16} /> : isImageExport ? <FileImage size={16} /> : <ArrowDownToLine size={16} />}{busy ? 'Working…' : isImageExport ? 'Download PNGs' : 'Download PDF'}</button></div></header>
+      <header className="editor-header"><button className="back-brand" type="button" onClick={returnHome} title="Exit editor"><ArrowLeft size={16} /><Brand compact /><span className="exit-label">Exit</span></button><div className="editor-filename"><FileText size={15} /><span>{files.length > 1 ? `${files.length} PDFs · ${pages.length} pages` : files[0]?.name}</span><span className="local-pill"><span /> Local</span></div><div className="editor-actions"><button className="icon-button" type="button" title="Undo last change" aria-label="Undo last change" onClick={undo} disabled={!history.length}><Undo2 size={17} /></button><button className="icon-button" type="button" title="Redo last undone change" aria-label="Redo last undone change" onClick={redo} disabled={!redoStack.length}><Redo2 size={17} /></button><button className="button button-primary save-button" type="button" disabled={busy} onClick={isImageExport ? saveImages : savePdf}>{busy ? <LoaderCircle className="spin" size={16} /> : isImageExport ? <FileImage size={16} /> : <ArrowDownToLine size={16} />}{busy ? 'Working…' : isImageExport ? 'Download PNGs' : 'Download PDF'}</button></div></header>
       <div className={`editor-layout${dragOver ? ' drag-highlight' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragOver(false); }} onDrop={onDrop} ref={dropRef}>
         <aside className="pages-sidebar"><div className="sidebar-title"><span>Pages</span><span className="page-count">{pages.length}</span></div><div className="thumbnail-list">{pages.map((item, index) => <div className={`thumbnail-row${activePage === index ? ' active-thumbnail' : ''}`} key={`${item.fileIndex}-${item.sourceIndex}-${index}`}><PageThumbnail file={files[item.fileIndex]} pageNumber={item.sourceIndex + 1} rotation={item.rotation} selected={activePage === index} onClick={() => setActivePage(index)} /><div className="thumb-actions"><button title="Move page up" type="button" onClick={() => movePage(index, -1)} disabled={index === 0}><ArrowUp size={13} /></button><button title="Move page down" type="button" onClick={() => movePage(index, 1)} disabled={index === pages.length - 1}><ArrowRight size={13} style={{ transform: 'rotate(90deg)' }} /></button><button title="Rotate page right" type="button" onClick={() => { setActivePage(index); updatePages(pages.map((p, i) => i === index ? { ...p, rotation: (p.rotation + 90) % 360 } : p)); }}><RotateCw size={13} /></button><button title="Delete page" type="button" onClick={() => removePage(index)}><Trash2 size={13} /></button></div></div>)}</div><button className="sidebar-add" type="button" onClick={() => startFlow('merge')}><Plus size={15} /> Add PDF pages</button><div className="sidebar-privacy"><LockKeyhole size={14} /> Files stay in this browser</div></aside>
-        <main className="editor-main"><div className="editing-toolbar"><div className="editing-tools">{[['select', MousePointer2, 'Select'], ['text', Type, 'Text'], ['highlight', Highlighter, 'Highlight'], ['shape', Circle, 'Shape'], ['signature', PencilLine, 'Sign'], ['image', ImagePlus, 'Image'], ['crop', Crop, 'Crop']].map(([key, Icon, label]) => <button className={`edit-tool${activeTool === key ? ' active-tool' : ''}`} key={key} type="button" onClick={() => { setActiveTool(key); setSelectedOverlayId(null); setDrawStart(null); setDrawRect(null); }} title={label}><Icon size={17} /><span>{label}</span></button>)}</div>{activeTool !== 'select' && <button className="cancel-tool" type="button" onClick={cancelTool}><X size={14} /><span>Cancel</span></button>}<span className="toolbar-divider" /><div className="zoom-control"><button type="button" title="Zoom out" onClick={() => setZoom(Math.max(0.55, zoom - 0.1))}><Minus size={15} /></button><span>{Math.round(zoom * 100)}%</span><button type="button" title="Zoom in" onClick={() => setZoom(Math.min(1.8, zoom + 0.1))}><Plus size={15} /></button><button className="fit-button" type="button" onClick={() => setZoom(1)}>Fit</button></div></div>
+        <main className="editor-main"><div className="editing-toolbar"><div className="editing-tools">{[['select', MousePointer2, 'Select'], ['text', Type, 'Text'], ['highlight', Highlighter, 'Highlight'], ['shape', Circle, 'Shape'], ['signature', PencilLine, 'Sign'], ['image', ImagePlus, 'Image'], ['crop', Crop, 'Crop']].map(([key, Icon, label]) => <button className={`edit-tool${activeTool === key ? ' active-tool' : ''}`} key={key} type="button" onClick={() => { setActiveTool(key); setSelectedOverlayId(null); setDrawStart(null); setDrawRect(null); }} title={label}><Icon size={17} /><span>{label}</span></button>)}</div>{activeTool !== 'select' && <button className="cancel-tool" type="button" title="Stop this tool; keep edits already applied" onClick={cancelTool}><X size={14} /><span>Stop tool</span></button>}<span className="toolbar-divider" /><div className="zoom-control"><button type="button" title="Zoom out" onClick={() => setZoom(Math.max(0.55, zoom - 0.1))}><Minus size={15} /></button><span>{Math.round(zoom * 100)}%</span><button type="button" title="Zoom in" onClick={() => setZoom(Math.min(1.8, zoom + 0.1))}><Plus size={15} /></button><button className="fit-button" type="button" title="Fit page to viewer" onClick={() => setZoom(1)}>Fit</button></div></div>
           <div className="editor-subbar">
             <span><strong>{toolDetails[activeTool][0]}</strong><span>{toolDetails[activeTool][1]}</span></span>
             <div className="subbar-actions">{selectedOverlayId && <button className="remove-annotation" type="button" title="Delete selected annotation" onClick={deleteSelectedOverlay}><Trash2 size={15} /><span>Remove</span></button>}{page?.crop && <button type="button" title="Reset page crop" onClick={clearCrop}><X size={15} /></button>}<button type="button" title="Rotate left" onClick={() => rotatePage(-90)}><RotateCcw size={15} /></button><button type="button" title="Rotate right" onClick={() => rotatePage(90)}><RotateCw size={15} /></button><button type="button" className="danger-action" title="Delete current page" onClick={() => removePage(activePage)}><Trash2 size={15} /></button></div>
@@ -555,10 +703,16 @@ function App() {
                 {page?.crop && <div className="crop-preview" style={{ '--crop-x': `${page.crop.x * 100}%`, '--crop-y': `${page.crop.y * 100}%`, '--crop-w': `${page.crop.w * 100}%`, '--crop-h': `${page.crop.h * 100}%` }}><span className="crop-shade shade-top" /><span className="crop-shade shade-left" /><span className="crop-shade shade-right" /><span className="crop-shade shade-bottom" /><span className="crop-frame" /></div>}
                 {(page?.overlays || []).map((overlay, index) => {
                   const selected = selectedOverlayId === overlay.id;
-                  const positioned = dragOverlay?.id === overlay.id ? { ...overlay, x: dragOverlay.x, y: dragOverlay.y } : overlay;
-                  if (overlay.points) return <PathOverlay key={overlay.id || index} overlay={overlay} pageHeight={pageSize.height} selected={selected} activeTool={activeTool} onSelect={() => setSelectedOverlayId(overlay.id)} />;
+                  const positioned = dragOverlay?.id === overlay.id ? { ...overlay, ...dragOverlay } : overlay;
+                  if (overlay.points) {
+                    const positionedPath = dragOverlay?.id === overlay.id
+                      ? { ...overlay, points: overlay.points.map((point) => ({ x: point.x + (dragOverlay.dx || 0), y: point.y + (dragOverlay.dy || 0) })) }
+                      : overlay;
+                    return <PathOverlay key={overlay.id || index} overlay={positionedPath} pageHeight={pageSize.height} selected={selected} activeTool={activeTool} onSelect={() => setSelectedOverlayId(overlay.id)} onPointerDown={(event) => beginPathMove(event, overlay)} onPointerMove={moveSelectedOverlay} onPointerUp={finishOverlayMove} />;
+                  }
                   const shapeClass = overlay.type === 'shape' && overlay.shapeKind === 'ellipse' ? ' overlay-ellipse' : '';
-                  return <div className={`pdf-overlay overlay-${overlay.type}${shapeClass}${selected ? ' overlay-selected' : ''}`} key={overlay.id || index} onClick={(event) => { if (activeTool === 'select') { event.stopPropagation(); setSelectedOverlayId(overlay.id); } }} onDoubleClick={(event) => editTextOverlay(event, overlay)} onPointerDown={(event) => beginOverlayMove(event, overlay)} onPointerMove={moveSelectedOverlay} onPointerUp={finishOverlayMove} style={{ left: `${positioned.x * 100}%`, top: `${positioned.y * 100}%`, width: `${(overlay.w || (overlay.type === 'image' ? 0.24 : 0.2)) * 100}%`, height: `${(overlay.h || 0.08) * 100}%`, color: overlay.color, borderColor: overlay.type === 'shape' ? overlay.color : undefined, backgroundColor: overlay.type === 'highlight' ? `${overlay.color}78` : undefined, fontSize: `${(overlay.fontSize || 18) * pageSize.height / (overlay.referenceHeight || pageSize.height)}px` }}>{overlay.type === 'image' ? <img src={overlay.dataUrl} alt="Added to document" /> : overlay.text || null}</div>;
+                  const isTextOverlay = overlay.type === 'text' || overlay.type === 'signature';
+                  return <div className={`pdf-overlay overlay-${overlay.type}${shapeClass}${selected ? ' overlay-selected' : ''}`} key={overlay.id || index} onClick={(event) => { if (activeTool === 'select') { event.stopPropagation(); setSelectedOverlayId(overlay.id); } }} onDoubleClick={(event) => editTextOverlay(event, overlay)} onPointerDown={(event) => beginOverlayMove(event, overlay)} onPointerMove={moveSelectedOverlay} onPointerUp={finishOverlayMove} style={{ left: `${positioned.x * 100}%`, top: `${positioned.y * 100}%`, width: `${(positioned.w || overlayWidth(positioned, pageSize)) * 100}%`, height: `${(positioned.h || 0.08) * 100}%`, color: overlay.color, borderColor: overlay.type === 'shape' ? overlay.color : undefined, backgroundColor: overlay.type === 'highlight' ? `${overlay.color}78` : undefined, fontSize: `${(positioned.fontSize || 18) * pageSize.height / (overlay.referenceHeight || pageSize.height)}px` }}>{overlay.type === 'image' ? <img src={overlay.dataUrl} alt="Added to document" /> : overlay.text || null}{selected && activeTool === 'select' && <button className={`overlay-resize-handle${isTextOverlay ? ' overlay-resize-text' : ''}`} type="button" aria-label={`Resize ${overlay.type === 'signature' ? 'signature' : overlay.type}`} title="Drag to resize" onPointerDown={(event) => beginOverlayResize(event, overlay)} onPointerUp={(event) => { event.stopPropagation(); finishOverlayResize(); }} />}</div>;
                 })}
                 {drawPoints.length > 1 && ((activeTool === 'shape' && ['freehand', 'line', 'arrow'].includes(shapeKind)) || (activeTool === 'highlight' && highlightKind === 'freehand')) && <PathOverlay overlay={{ type: activeTool === 'highlight' ? 'highlight' : 'shape', shapeKind: activeTool === 'highlight' ? 'freehand' : shapeKind, x: 0, y: 0, w: 1, h: 1, points: drawPoints, color: activeTool === 'highlight' ? highlightColor : shapeColor, strokeWidth: activeTool === 'highlight' ? highlightWidth : shapeWidth, referenceHeight: pageSize.referenceHeight }} pageHeight={pageSize.height} selected={false} activeTool={activeTool} onSelect={() => {}} />}
                 {drawRect && !((activeTool === 'shape' && ['freehand', 'line', 'arrow'].includes(shapeKind)) || (activeTool === 'highlight' && highlightKind === 'freehand')) && <div className={`pdf-overlay ${activeTool === 'crop' ? 'crop-frame' : activeTool === 'shape' && shapeKind === 'ellipse' ? 'overlay-ellipse' : activeTool === 'highlight' ? 'overlay-highlight' : 'overlay-shape'}`} style={{ left: `${drawRect.x * 100}%`, top: `${drawRect.y * 100}%`, width: `${drawRect.w * 100}%`, height: `${drawRect.h * 100}%`, borderColor: activeTool === 'shape' ? shapeColor : undefined, backgroundColor: activeTool === 'highlight' ? `${highlightColor}78` : undefined }} />}
